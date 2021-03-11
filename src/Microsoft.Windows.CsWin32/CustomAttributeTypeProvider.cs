@@ -4,10 +4,7 @@
 namespace Microsoft.Windows.CsWin32
 {
     using System;
-    using System.Collections.Generic;
     using System.Reflection.Metadata;
-    using System.Text;
-    using Microsoft.CodeAnalysis;
     using Microsoft.CodeAnalysis.CSharp;
     using Microsoft.CodeAnalysis.CSharp.Syntax;
     using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;

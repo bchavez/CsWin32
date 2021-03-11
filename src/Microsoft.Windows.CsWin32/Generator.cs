@@ -30,6 +30,7 @@ namespace Microsoft.Windows.CsWin32
     {
         internal static readonly SyntaxAnnotation IsManagedTypeAnnotation = new SyntaxAnnotation("IsManagedType");
         internal static readonly SyntaxAnnotation IsSafeHandleTypeAnnotation = new SyntaxAnnotation("IsSafeHandleType");
+        internal static readonly SyntaxAnnotation IsRetValAnnotation = new SyntaxAnnotation("RetVal");
 
         internal static readonly Dictionary<string, TypeSyntax> BclInteropStructs = new Dictionary<string, TypeSyntax>(StringComparer.Ordinal)
         {
@@ -103,6 +104,7 @@ namespace Microsoft.Windows.CsWin32
         private static readonly IdentifierNameSyntax InlineArrayIndexerExtensionsClassName = IdentifierName("InlineArrayIndexerExtensions");
         private static readonly TypeSyntax SafeHandleTypeSyntax = IdentifierName("SafeHandle");
         private static readonly IdentifierNameSyntax IntPtrTypeSyntax = IdentifierName(nameof(IntPtr));
+        private static readonly AttributeSyntax PreserveSigAttribute = Attribute(IdentifierName("PreserveSig"));
         private static readonly AttributeListSyntax DefaultDllImportSearchPathsAttributeList = AttributeList().AddAttributes(
             Attribute(IdentifierName("DefaultDllImportSearchPaths")).AddArgumentListArguments(AttributeArgument(MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, IdentifierName(nameof(DllImportSearchPath)), IdentifierName(nameof(DllImportSearchPath.System32))))));
 
@@ -242,14 +244,21 @@ namespace Microsoft.Windows.CsWin32
         private static readonly AttributeSyntax FlagsAttributeSyntax = Attribute(IdentifierName("Flags"));
         private static readonly AttributeSyntax FieldOffsetAttributeSyntax = Attribute(IdentifierName("FieldOffset"));
 
+        private readonly TypeSyntaxParameters generalTypeSettings;
+        private readonly TypeSyntaxParameters fieldTypeSettings;
+        private readonly TypeSyntaxParameters delegateSignatureTypeSettings;
+        private readonly TypeSyntaxParameters enumTypeSettings;
+        private readonly TypeSyntaxParameters fieldOfHandleTypeDefTypeSettings;
+        private readonly TypeSyntaxParameters externSignatureTypeSettings;
+        private readonly TypeSyntaxParameters externReleaseSignatureTypeSettings;
+        private readonly TypeSyntaxParameters comSignatureTypeSettings;
+        private readonly TypeSyntaxParameters extensionMethodSignatureTypeSettings;
+        private readonly TypeSyntaxParameters functionPointerTypeSettings;
+        private readonly TypeSyntaxParameters errorMessageTypeSettings;
+
         private readonly Stream metadataStream;
         private readonly PEReader peReader;
         private readonly MetadataReader mr;
-        private readonly SignatureTypeProvider signatureTypeProvider;
-        private readonly SignatureTypeProvider signatureTypeProviderFullyQualified;
-        private readonly SignatureTypeProvider signatureTypeProviderAlwaysUseIntPtr;
-        private readonly SignatureTypeProvider signatureTypeProviderNoMarshaledTypes;
-        private readonly SignatureTypeProvider signatureTypeProviderNoMarshaledTypesOrNint;
         private readonly CustomAttributeTypeProvider customAttributeTypeProvider;
         private readonly Dictionary<string, List<MemberDeclarationSyntax>> modulesAndMembers = new Dictionary<string, List<MemberDeclarationSyntax>>(StringComparer.OrdinalIgnoreCase);
 
@@ -302,6 +311,8 @@ namespace Microsoft.Windows.CsWin32
 
         private readonly HashSet<string> releaseMethods = new HashSet<string>(StringComparer.Ordinal);
 
+        private readonly Dictionary<TypeReferenceHandle, TypeDefinitionHandle> refToDefCache = new();
+
         private readonly GeneratorOptions options;
         private readonly CSharpCompilation? compilation;
         private readonly CSharpParseOptions? parseOptions;
@@ -327,11 +338,24 @@ namespace Microsoft.Windows.CsWin32
             this.peReader = new PEReader(this.metadataStream);
             this.mr = this.peReader.GetMetadataReader();
 
-            this.signatureTypeProvider = new SignatureTypeProvider(this, preferNativeInt: this.LanguageVersion >= LanguageVersion.CSharp9, preferMarshaledTypes: true, fullyQualifiedNames: false);
-            this.signatureTypeProviderFullyQualified = new SignatureTypeProvider(this, preferNativeInt: this.LanguageVersion >= LanguageVersion.CSharp9, preferMarshaledTypes: true, fullyQualifiedNames: true);
-            this.signatureTypeProviderAlwaysUseIntPtr = new SignatureTypeProvider(this, preferNativeInt: false, preferMarshaledTypes: true, fullyQualifiedNames: false);
-            this.signatureTypeProviderNoMarshaledTypes = new SignatureTypeProvider(this, preferNativeInt: true, preferMarshaledTypes: false, fullyQualifiedNames: false);
-            this.signatureTypeProviderNoMarshaledTypesOrNint = new SignatureTypeProvider(this, preferNativeInt: false, preferMarshaledTypes: false, fullyQualifiedNames: false);
+            bool useComInterfaces = !options.ComInterop.StructsInsteadOfInterfaces;
+            this.generalTypeSettings = new TypeSyntaxParameters(
+                this,
+                PreferNativeInt: this.LanguageVersion >= LanguageVersion.CSharp9,
+                PreferMarshaledTypes: false,
+                UseComInterfaces: !options.ComInterop.StructsInsteadOfInterfaces,
+                QualifyNames: false);
+            this.fieldTypeSettings = this.generalTypeSettings;
+            this.delegateSignatureTypeSettings = this.generalTypeSettings;
+            this.enumTypeSettings = this.generalTypeSettings;
+            this.fieldOfHandleTypeDefTypeSettings = this.generalTypeSettings with { PreferNativeInt = false };
+            this.externSignatureTypeSettings = this.generalTypeSettings with { PreferMarshaledTypes = true };
+            this.externReleaseSignatureTypeSettings = this.generalTypeSettings with { PreferNativeInt = false };
+            this.comSignatureTypeSettings = this.generalTypeSettings;
+            this.extensionMethodSignatureTypeSettings = this.generalTypeSettings with { QualifyNames = true };
+            this.functionPointerTypeSettings = this.generalTypeSettings;
+            this.errorMessageTypeSettings = this.generalTypeSettings with { QualifyNames = true };
+
             this.customAttributeTypeProvider = new CustomAttributeTypeProvider();
 
             this.Apis = this.mr.TypeDefinitions.Select(this.mr.GetTypeDefinition).Where(td => this.mr.StringComparer.Equals(td.Name, "Apis")).ToList();
@@ -376,7 +400,7 @@ namespace Microsoft.Windows.CsWin32
                                     fieldEnum.MoveNext();
                                     FieldDefinitionHandle fieldHandle = fieldEnum.Current;
                                     FieldDefinition fieldDef = this.mr.GetFieldDefinition(fieldHandle);
-                                    if (fieldDef.DecodeSignature(this.signatureTypeProviderNoMarshaledTypesOrNint, null) is IdentifierNameSyntax idName && idName.Identifier.ValueText == nameof(IntPtr))
+                                    if (fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null) is PrimitiveTypeHandleInfo { PrimitiveTypeCode: PrimitiveTypeCode.IntPtr })
                                     {
                                         this.handleTypeStructsWithIntPtrSizeFields.Add(name);
                                     }
@@ -437,13 +461,13 @@ namespace Microsoft.Windows.CsWin32
                     .Concat(this.specialTypes.Values)
                     .Concat(this.types.Values);
 
-                ClassDeclarationSyntax constantClass = this.CreateConstantDefiningClass();
+                ClassDeclarationSyntax constantClass = this.DeclareConstantDefiningClass();
                 if (constantClass.Members.Count > 0)
                 {
                     result = result.Concat(new MemberDeclarationSyntax[] { constantClass });
                 }
 
-                ClassDeclarationSyntax inlineArrayIndexerExtensionsClass = this.CreateInlineArrayIndexerExtensionsClass();
+                ClassDeclarationSyntax inlineArrayIndexerExtensionsClass = this.DeclareInlineArrayIndexerExtensionsClass();
                 if (inlineArrayIndexerExtensionsClass.Members.Count > 0)
                 {
                     result = result.Concat(new MemberDeclarationSyntax[] { inlineArrayIndexerExtensionsClass });
@@ -476,7 +500,7 @@ namespace Microsoft.Windows.CsWin32
 
             // Also generate all structs/enum types too, even if not referenced by a method,
             // since some methods use `void*` types and require structs at runtime.
-            this.GenerateAllInteropTypes(cancellationToken);
+            this.RequestAllInteropTypes(cancellationToken);
 
             this.GenerateAllConstants(cancellationToken);
         }
@@ -579,7 +603,7 @@ namespace Microsoft.Windows.CsWin32
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                this.GenerateExternMethod(methodHandle);
+                this.RequestExternMethod(methodHandle);
             }
         }
 
@@ -593,7 +617,7 @@ namespace Microsoft.Windows.CsWin32
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                this.GenerateConstant(fieldDefHandle);
+                this.RequestConstant(fieldDefHandle);
             }
         }
 
@@ -636,7 +660,7 @@ namespace Microsoft.Windows.CsWin32
                         continue;
                     }
 
-                    this.GenerateExternMethod(methodHandle);
+                    this.RequestExternMethod(methodHandle);
                     successful = true;
                 }
             }
@@ -658,20 +682,20 @@ namespace Microsoft.Windows.CsWin32
 
             if (this.methodsByName.TryGetValue(name, out MethodDefinitionHandle handle))
             {
-                this.GenerateExternMethod(handle);
+                this.RequestExternMethod(handle);
                 return true;
             }
 
             bool successful = false;
             if (this.methodsByName.TryGetValue(name + "W", out handle))
             {
-                this.GenerateExternMethod(handle);
+                this.RequestExternMethod(handle);
                 successful = true;
             }
 
             if (this.methodsByName.TryGetValue(name + "A", out handle))
             {
-                this.GenerateExternMethod(handle);
+                this.RequestExternMethod(handle);
                 successful = true;
             }
 
@@ -687,7 +711,7 @@ namespace Microsoft.Windows.CsWin32
         {
             if (this.typesByName.TryGetValue(name, out TypeDefinitionHandle typeDefHandle))
             {
-                this.GenerateInteropType(typeDefHandle);
+                this.RequestInteropType(typeDefHandle);
                 return true;
             }
 
@@ -703,7 +727,7 @@ namespace Microsoft.Windows.CsWin32
         {
             if (this.fieldsByName.TryGetValue(name, out FieldDefinitionHandle fieldDefHandle))
             {
-                this.GenerateConstant(fieldDefHandle);
+                this.RequestConstant(fieldDefHandle);
                 return true;
             }
 
@@ -738,6 +762,7 @@ namespace Microsoft.Windows.CsWin32
                             {
                                 ClassDeclarationSyntax classDecl => classDecl.Identifier.ValueText,
                                 StructDeclarationSyntax structDecl => structDecl.Identifier.ValueText,
+                                InterfaceDeclarationSyntax ifaceDecl => ifaceDecl.Identifier.ValueText,
                                 EnumDeclarationSyntax enumDecl => enumDecl.Identifier.ValueText,
                                 DelegateDeclarationSyntax delegateDecl => "Delegates", // group all delegates in one file
                                 _ => throw new NotSupportedException("Unsupported member type: " + member.GetType().Name),
@@ -787,7 +812,7 @@ namespace Microsoft.Windows.CsWin32
             return this.handleTypeReleaseMethod.TryGetValue(handleStructName, out releaseMethod);
         }
 
-        internal void GenerateAllInteropTypes(CancellationToken cancellationToken)
+        internal void RequestAllInteropTypes(CancellationToken cancellationToken)
         {
             foreach (TypeDefinitionHandle typeDefinitionHandle in this.mr.TypeDefinitions)
             {
@@ -798,11 +823,11 @@ namespace Microsoft.Windows.CsWin32
                     continue;
                 }
 
-                this.GenerateInteropType(typeDefinitionHandle);
+                this.RequestInteropType(typeDefinitionHandle);
             }
         }
 
-        internal void GenerateExternMethod(MethodDefinitionHandle methodDefinitionHandle)
+        internal void RequestExternMethod(MethodDefinitionHandle methodDefinitionHandle)
         {
             if (methodDefinitionHandle.IsNil)
             {
@@ -814,95 +839,14 @@ namespace Microsoft.Windows.CsWin32
                 return;
             }
 
-            MethodDefinition methodDefinition = this.mr.GetMethodDefinition(methodDefinitionHandle);
-            MethodImport import = methodDefinition.GetImport();
-            if (import.Name.IsNil)
-            {
-                // Not an exported method.
-                return;
-            }
-
-            var methodName = this.mr.GetString(methodDefinition.Name);
-            try
-            {
-                if (this.WideCharOnly && IsAnsiFunction(methodName))
-                {
-                    // Skip Ansi functions.
-                    return;
-                }
-
-                var moduleName = this.GetNormalizedModuleName(import);
-
-                if (false && !CanonicalCapitalizations.Contains(moduleName))
-                {
-                    // Skip methods for modules we are not prepared to export.
-                    return;
-                }
-
-                string? entrypoint = null;
-                if (this.TryGetRenamedMethod(methodName, out string? newName))
-                {
-                    entrypoint = methodName;
-                    methodName = newName;
-                }
-
-                // If this method releases a handle, recreate the method signature such that we take the struct rather than the SafeHandle as a parameter.
-                var signatureTypeProvider = this.releaseMethods.Contains(entrypoint ?? methodName) ? this.signatureTypeProviderNoMarshaledTypesOrNint : this.signatureTypeProvider;
-                MethodSignature<TypeSyntax> signature = methodDefinition.DecodeSignature(signatureTypeProvider, null);
-
-                CustomAttributeHandleCollection? returnTypeAttributes = this.GetReturnTypeCustomAttributes(methodDefinition);
-
-                TypeSyntax returnType = signature.ReturnType;
-                AttributeSyntax? returnTypeAttribute = null;
-                if (returnTypeAttributes.HasValue)
-                {
-                    (returnType, returnTypeAttribute) = this.ReinterpretMethodSignatureType(signature.ReturnType, returnTypeAttributes.Value, isReturnOrOutParam: true);
-                }
-
-                MethodDeclarationSyntax methodDeclaration = MethodDeclaration(
-                    List<AttributeListSyntax>()
-                        .Add(AttributeList().AddAttributes(DllImport(import, moduleName, entrypoint)))
-                        .Add(DefaultDllImportSearchPathsAttributeList),
-                    modifiers: TokenList(Token(this.Visibility), Token(SyntaxKind.StaticKeyword), Token(SyntaxKind.ExternKeyword)),
-                    returnType,
-                    explicitInterfaceSpecifier: null!,
-                    SafeIdentifier(methodName),
-                    null!,
-                    this.CreateParameterList(methodDefinition, signature),
-                    List<TypeParameterConstraintClauseSyntax>(),
-                    body: null!,
-                    Token(SyntaxKind.SemicolonToken));
-                if (returnTypeAttribute is object)
-                {
-                    methodDeclaration = methodDeclaration.AddAttributeLists(
-                        AttributeList().WithTarget(AttributeTargetSpecifier(Token(SyntaxKind.ReturnKeyword))).AddAttributes(returnTypeAttribute));
-                }
-
-                // Add documentation if we can find it.
-                methodDeclaration = AddApiDocumentation(entrypoint ?? methodName, methodDeclaration);
-
-                List<MemberDeclarationSyntax> methodsList = this.GetModuleMemberList(moduleName);
-                if (RequiresUnsafe(methodDeclaration.ReturnType) || methodDeclaration.ParameterList.Parameters.Any(p => RequiresUnsafe(p.Type)))
-                {
-                    methodDeclaration = methodDeclaration.AddModifiers(Token(SyntaxKind.UnsafeKeyword));
-                }
-
-                methodsList.AddRange(this.CreateFriendlyOverloads(methodDefinition, methodDeclaration, this.GroupByModule ? GetClassNameForModule(moduleName) : this.SingleClassName, isStatic: true));
-
-                methodsList.Add(methodDeclaration);
-            }
-            catch (Exception ex)
-            {
-                throw new GenerationFailedException($"Failed while generating extern method: {methodName}", ex);
-            }
+            this.DeclareExternMethod(methodDefinitionHandle);
         }
 
-        internal TypeDefinitionHandle? GenerateInteropType(TypeReferenceHandle typeRefHandle)
+        internal TypeDefinitionHandle? RequestInteropType(TypeReferenceHandle typeRefHandle)
         {
-            TypeReference typeRef = this.mr.GetTypeReference(typeRefHandle);
-            if (this.TryGetTypeDefHandle(typeRef, out TypeDefinitionHandle typeDefHandle))
+            if (this.TryGetTypeDefHandle(typeRefHandle, out TypeDefinitionHandle typeDefHandle))
             {
-                this.GenerateInteropType(typeDefHandle);
+                this.RequestInteropType(typeDefHandle);
                 return typeDefHandle;
             }
             else
@@ -913,13 +857,26 @@ namespace Microsoft.Windows.CsWin32
             }
         }
 
-        internal void GenerateInteropType(TypeDefinitionHandle typeDefHandle)
+        internal bool IsInterface(string name) => this.typesByName.TryGetValue(name, out TypeDefinitionHandle tdh) && (this.mr.GetTypeDefinition(tdh).Attributes & TypeAttributes.Interface) == TypeAttributes.Interface;
+
+        internal bool IsInterface(TypeReferenceHandle typeRefHandle)
+        {
+            if (this.TryGetTypeDefHandle(typeRefHandle, out TypeDefinitionHandle typeDefHandle))
+            {
+                TypeDefinition typeDef = this.mr.GetTypeDefinition(typeDefHandle);
+                return (typeDef.Attributes & TypeAttributes.Interface) == TypeAttributes.Interface;
+            }
+
+            return false;
+        }
+
+        internal void RequestInteropType(TypeDefinitionHandle typeDefHandle)
         {
             TypeDefinition typeDef = this.mr.GetTypeDefinition(typeDefHandle);
             if (typeDef.GetDeclaringType() is { IsNil: false } nestingParentHandle)
             {
                 // We should only generate this type into its parent type.
-                this.GenerateInteropType(nestingParentHandle);
+                this.RequestInteropType(nestingParentHandle);
                 return;
             }
 
@@ -944,42 +901,19 @@ namespace Microsoft.Windows.CsWin32
             }
         }
 
-        internal NameSyntax GetQualifiedName(TypeDefinitionHandle typeDefHandle) => this.GetQualifiedName(this.mr.GetTypeDefinition(typeDefHandle));
-
-        internal NameSyntax GetQualifiedName(TypeDefinition typeDef)
-        {
-            IdentifierNameSyntax ownName = IdentifierName(this.mr.GetString(typeDef.Name));
-            TypeDefinitionHandle nestingType = typeDef.GetDeclaringType();
-            return nestingType.IsNil ? ownName : QualifiedName(this.GetQualifiedName(nestingType), ownName);
-        }
-
-        internal NameSyntax GetQualifiedName(TypeReference typeRef)
-        {
-            SimpleNameSyntax typeName = IdentifierName(this.mr.GetString(typeRef.Name));
-
-            if (typeRef.ResolutionScope.Kind == HandleKind.TypeReference)
-            {
-                // A nested type must be looked up by its nesting parent qualified name.
-                TypeReference nestingTR = this.mr.GetTypeReference((TypeReferenceHandle)typeRef.ResolutionScope);
-                return QualifiedName(this.GetQualifiedName(nestingTR), typeName);
-            }
-
-            return typeName;
-        }
-
-        internal void GenerateConstant(FieldDefinitionHandle fieldDefHandle)
+        internal void RequestConstant(FieldDefinitionHandle fieldDefHandle)
         {
             if (this.fieldsToSyntax.ContainsKey(fieldDefHandle))
             {
                 return;
             }
 
-            FieldDeclarationSyntax constantDeclaration = this.CreateField(fieldDefHandle);
+            FieldDeclarationSyntax constantDeclaration = this.DeclareField(fieldDefHandle);
             constantDeclaration = AddApiDocumentation(constantDeclaration.Declaration.Variables[0].Identifier.ValueText, constantDeclaration);
             this.fieldsToSyntax.Add(fieldDefHandle, constantDeclaration);
         }
 
-        internal TypeSyntax? GenerateSafeHandle(string releaseMethod)
+        internal TypeSyntax? RequestSafeHandle(string releaseMethod)
         {
             if (this.releaseMethodsWithSafeHandleTypesGenerating.TryGetValue(releaseMethod, out TypeSyntax? safeHandleType))
             {
@@ -1003,8 +937,8 @@ namespace Microsoft.Windows.CsWin32
                 : safeHandleTypeIdentifier;
             safeHandleType = safeHandleType.WithAdditionalAnnotations(IsManagedTypeAnnotation, IsSafeHandleTypeAnnotation);
 
-            var releaseMethodSignature = releaseMethodDef.DecodeSignature(this.signatureTypeProviderNoMarshaledTypesOrNint, null);
-            TypeSyntax releaseMethodParameterType = releaseMethodSignature.ParameterTypes[0];
+            MethodSignature<TypeHandleInfo> releaseMethodSignature = releaseMethodDef.DecodeSignature(SignatureHandleProvider.Instance, null);
+            TypeSyntax releaseMethodParameterType = releaseMethodSignature.ParameterTypes[0].ToTypeSyntax(this.externSignatureTypeSettings);
 
             // If the release method takes more than one parameter, we can't generate a SafeHandle for it.
             if (releaseMethodSignature.RequiredParameterCount != 1)
@@ -1024,11 +958,11 @@ namespace Microsoft.Windows.CsWin32
                 return safeHandleType;
             }
 
-            this.GenerateExternMethod(releaseMethodHandle);
+            this.RequestExternMethod(releaseMethodHandle);
 
             TypeSyntax releaseMethodReturnType = this.GetReturnTypeCustomAttributes(releaseMethodDef) is { } atts
-                 ? this.ReinterpretMethodSignatureType(releaseMethodSignature.ReturnType, atts, isReturnOrOutParam: true).Type
-                 : releaseMethodSignature.ReturnType;
+                ? this.ReinterpretMethodSignatureType(releaseMethodSignature.ReturnType, atts, isReturnOrOutParam: true, this.externSignatureTypeSettings).Type
+                : releaseMethodSignature.ReturnType.ToTypeSyntax(this.externSignatureTypeSettings);
 
             this.TryGetRenamedMethod(releaseMethod, out string? renamedReleaseMethod);
 
@@ -1588,11 +1522,11 @@ namespace Microsoft.Windows.CsWin32
             return memberWithVisibility;
         }
 
-        private FunctionPointerTypeSyntax FunctionPointer(CallingConvention callingConvention, MethodSignature<TypeSyntax> signature, string delegateName)
+        private FunctionPointerTypeSyntax FunctionPointer(CallingConvention callingConvention, MethodSignature<TypeHandleInfo> signature, string delegateName)
             => FunctionPointerType(
                 FunctionPointerCallingConvention(Token(SyntaxKind.UnmanagedKeyword), FunctionPointerUnmanagedCallingConventionList(SingletonSeparatedList(ToUnmanagedCallingConventionSyntax(callingConvention)))),
-                FunctionPointerParameterList(SeparatedList(signature.ParameterTypes.Select(p => this.TranslateDelegateToFunctionPointer(FunctionPointerParameter(p))))
-                    .Add(this.TranslateDelegateToFunctionPointer(FunctionPointerParameter(signature.ReturnType)))))
+                FunctionPointerParameterList(SeparatedList(signature.ParameterTypes.Select(p => this.TranslateDelegateToFunctionPointer(FunctionPointerParameter(p.ToTypeSyntax(this.functionPointerTypeSettings)))))
+                    .Add(this.TranslateDelegateToFunctionPointer(FunctionPointerParameter(signature.ReturnType.ToTypeSyntax(this.functionPointerTypeSettings))))))
                .WithAdditionalAnnotations(new SyntaxAnnotation(OriginalDelegateAnnotation, delegateName));
 
         private FunctionPointerParameterSyntax TranslateDelegateToFunctionPointer(FunctionPointerParameterSyntax parameter)
@@ -1736,18 +1670,18 @@ namespace Microsoft.Windows.CsWin32
 
                 if ((typeDef.Attributes & TypeAttributes.Interface) == TypeAttributes.Interface)
                 {
-                    typeDeclaration = this.CreateInterface(typeDef);
+                    typeDeclaration = this.DeclareInterface(typeDef);
                 }
                 else if (this.mr.StringComparer.Equals(baseTypeName, nameof(ValueType)) && this.mr.StringComparer.Equals(baseTypeNamespace, nameof(System)))
                 {
                     // Is this a special typedef struct?
                     if (this.IsTypeDefStruct(typeDef))
                     {
-                        typeDeclaration = this.CreateTypeDefStruct(typeDef);
+                        typeDeclaration = this.DeclareTypeDefStruct(typeDef);
                     }
                     else
                     {
-                        StructDeclarationSyntax structDeclaration = this.CreateInteropStruct(typeDef);
+                        StructDeclarationSyntax structDeclaration = this.DeclareInteropStruct(typeDef);
 
                         // Proactively generate all nested types as well.
                         NameSyntax nestedDeclaringType = declaringType is null ? IdentifierName(name) : QualifiedName(declaringType, IdentifierName(name));
@@ -1765,11 +1699,11 @@ namespace Microsoft.Windows.CsWin32
                 else if (this.mr.StringComparer.Equals(baseTypeName, nameof(Enum)) && this.mr.StringComparer.Equals(baseTypeNamespace, nameof(System)))
                 {
                     // Consider reusing .NET types like FILE_SHARE_FLAGS -> System.IO.FileShare
-                    typeDeclaration = this.CreateInteropEnum(typeDef);
+                    typeDeclaration = this.DeclareInteropEnum(typeDef);
                 }
                 else if (this.mr.StringComparer.Equals(baseTypeName, nameof(MulticastDelegate)) && this.mr.StringComparer.Equals(baseTypeNamespace, nameof(System)))
                 {
-                    typeDeclaration = this.CreateInteropDelegate(typeDef);
+                    typeDeclaration = this.DeclareInteropDelegate(typeDef);
                 }
                 else
                 {
@@ -1785,7 +1719,7 @@ namespace Microsoft.Windows.CsWin32
             }
         }
 
-        private MemberDeclarationSyntax? GenerateTypeDefStruct(string specialName)
+        private MemberDeclarationSyntax? RequestTypeDefStruct(string specialName)
         {
             // Skip if the compilation already defines this type or can access it from elsewhere.
             string fullyQualifiedName = this.Namespace + "." + specialName;
@@ -1825,13 +1759,103 @@ namespace Microsoft.Windows.CsWin32
 
         private bool IsTypeDefStruct(TypeDefinition typeDef) => typeDef.GetCustomAttributes().Any(att => this.IsAttribute(this.mr.GetCustomAttribute(att), InteropDecorationNamespace, NativeTypedefAttribute));
 
-        private FieldDeclarationSyntax CreateField(FieldDefinitionHandle fieldDefHandle)
+        private void DeclareExternMethod(MethodDefinitionHandle methodDefinitionHandle)
+        {
+            MethodDefinition methodDefinition = this.mr.GetMethodDefinition(methodDefinitionHandle);
+            MethodImport import = methodDefinition.GetImport();
+            if (import.Name.IsNil)
+            {
+                // Not an exported method.
+                return;
+            }
+
+            var methodName = this.mr.GetString(methodDefinition.Name);
+            try
+            {
+                if (this.WideCharOnly && IsAnsiFunction(methodName))
+                {
+                    // Skip Ansi functions.
+                    return;
+                }
+
+                var moduleName = this.GetNormalizedModuleName(import);
+
+                if (false && !CanonicalCapitalizations.Contains(moduleName))
+                {
+                    // Skip methods for modules we are not prepared to export.
+                    return;
+                }
+
+                string? entrypoint = null;
+                if (this.TryGetRenamedMethod(methodName, out string? newName))
+                {
+                    entrypoint = methodName;
+                    methodName = newName;
+                }
+
+                // If this method releases a handle, recreate the method signature such that we take the struct rather than the SafeHandle as a parameter.
+                TypeSyntaxParameters typeSettings = this.releaseMethods.Contains(entrypoint ?? methodName) ? this.externReleaseSignatureTypeSettings : this.externSignatureTypeSettings;
+                MethodSignature<TypeHandleInfo> signature = methodDefinition.DecodeSignature(SignatureHandleProvider.Instance, null);
+
+                CustomAttributeHandleCollection? returnTypeAttributes = this.GetReturnTypeCustomAttributes(methodDefinition);
+
+                TypeSyntax returnType;
+                AttributeSyntax? returnTypeAttribute = null;
+                if (returnTypeAttributes.HasValue)
+                {
+                    (returnType, returnTypeAttribute) = this.ReinterpretMethodSignatureType(signature.ReturnType, returnTypeAttributes.Value, isReturnOrOutParam: true, typeSettings);
+                }
+                else
+                {
+                    returnType = signature.ReturnType.ToTypeSyntax(typeSettings);
+                }
+
+                MethodDeclarationSyntax methodDeclaration = MethodDeclaration(
+                    List<AttributeListSyntax>()
+                        .Add(AttributeList().AddAttributes(DllImport(import, moduleName, entrypoint)))
+                        .Add(DefaultDllImportSearchPathsAttributeList),
+                    modifiers: TokenList(Token(this.Visibility), Token(SyntaxKind.StaticKeyword), Token(SyntaxKind.ExternKeyword)),
+                    returnType,
+                    explicitInterfaceSpecifier: null!,
+                    SafeIdentifier(methodName),
+                    null!,
+                    this.CreateParameterList(methodDefinition, signature, typeSettings),
+                    List<TypeParameterConstraintClauseSyntax>(),
+                    body: null!,
+                    Token(SyntaxKind.SemicolonToken));
+                if (returnTypeAttribute is object)
+                {
+                    methodDeclaration = methodDeclaration.AddAttributeLists(
+                        AttributeList().WithTarget(AttributeTargetSpecifier(Token(SyntaxKind.ReturnKeyword))).AddAttributes(returnTypeAttribute));
+                }
+
+                // Add documentation if we can find it.
+                methodDeclaration = AddApiDocumentation(entrypoint ?? methodName, methodDeclaration);
+
+                List<MemberDeclarationSyntax> methodsList = this.GetModuleMemberList(moduleName);
+                if (RequiresUnsafe(methodDeclaration.ReturnType) || methodDeclaration.ParameterList.Parameters.Any(p => RequiresUnsafe(p.Type)))
+                {
+                    methodDeclaration = methodDeclaration.AddModifiers(Token(SyntaxKind.UnsafeKeyword));
+                }
+
+                methodsList.AddRange(this.DeclareFriendlyOverloads(methodDefinition, methodDeclaration, this.GroupByModule ? GetClassNameForModule(moduleName) : this.SingleClassName, isStatic: true));
+
+                methodsList.Add(methodDeclaration);
+            }
+            catch (Exception ex)
+            {
+                throw new GenerationFailedException($"Failed while generating extern method: {methodName}", ex);
+            }
+        }
+
+        private FieldDeclarationSyntax DeclareField(FieldDefinitionHandle fieldDefHandle)
         {
             FieldDefinition fieldDef = this.mr.GetFieldDefinition(fieldDefHandle);
             string name = this.mr.GetString(fieldDef.Name);
             try
             {
-                TypeSyntax fieldType = fieldDef.DecodeSignature(this.signatureTypeProviderNoMarshaledTypes, null);
+                TypeHandleInfo fieldTypeInfo = fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null);
+                TypeSyntax fieldType = fieldTypeInfo.ToTypeSyntax(this.fieldTypeSettings);
                 Constant constant = this.mr.GetConstant(fieldDef.GetDefaultValue());
                 ExpressionSyntax value = this.ToExpressionSyntax(constant);
                 if (fieldType is not PredefinedTypeSyntax)
@@ -1870,14 +1894,14 @@ namespace Microsoft.Windows.CsWin32
             }
         }
 
-        private ClassDeclarationSyntax CreateConstantDefiningClass()
+        private ClassDeclarationSyntax DeclareConstantDefiningClass()
         {
             return ClassDeclaration(ConstantsClassName.Identifier)
                 .AddMembers(this.fieldsToSyntax.Values.ToArray())
                 .WithModifiers(TokenList(Token(this.Visibility), Token(SyntaxKind.StaticKeyword), Token(SyntaxKind.PartialKeyword)));
         }
 
-        private ClassDeclarationSyntax CreateInlineArrayIndexerExtensionsClass()
+        private ClassDeclarationSyntax DeclareInlineArrayIndexerExtensionsClass()
         {
             return ClassDeclaration(InlineArrayIndexerExtensionsClassName.Identifier)
                 .AddMembers(this.inlineArrayIndexerExtensionsMembers.ToArray())
@@ -1885,17 +1909,49 @@ namespace Microsoft.Windows.CsWin32
         }
 
         /// <summary>
-        /// Attempts to translate a <see cref="TypeReference"/> to a <see cref="TypeDefinitionHandle"/>.
+        /// Attempts to translate a <see cref="TypeReferenceHandle"/> to a <see cref="TypeDefinitionHandle"/>.
         /// </summary>
-        private bool TryGetTypeDefHandle(TypeReference typeRef, out TypeDefinitionHandle typeDefHandle)
+        private bool TryGetTypeDefHandle(TypeReferenceHandle typeRefHandle, out TypeDefinitionHandle typeDefHandle)
         {
-            string typeName = this.mr.GetString(typeRef.Name);
-            if (typeRef.ResolutionScope.Kind == HandleKind.TypeReference)
+            if (this.refToDefCache.TryGetValue(typeRefHandle, out typeDefHandle))
             {
-                // A nested type must be looked up by its nesting parent qualified name.
-                TypeReference nestingTR = this.mr.GetTypeReference((TypeReferenceHandle)typeRef.ResolutionScope);
+                return !typeDefHandle.IsNil;
             }
 
+            var typeRef = this.mr.GetTypeReference(typeRefHandle);
+            foreach (TypeDefinitionHandle tdh in this.mr.TypeDefinitions)
+            {
+                TypeDefinition typeDef = this.mr.GetTypeDefinition(tdh);
+                if (typeDef.Name == typeRef.Name && typeDef.Namespace == typeRef.Namespace)
+                {
+                    if (typeRef.ResolutionScope.Kind == HandleKind.TypeReference)
+                    {
+                        // The ref is nested. Verify that the type we found is nested in the same type as well.
+                        if (this.TryGetTypeDefHandle((TypeReferenceHandle)typeRef.ResolutionScope, out TypeDefinitionHandle nestingTypeDef) && nestingTypeDef == typeDef.GetDeclaringType())
+                        {
+                            typeDefHandle = tdh;
+                            break;
+                        }
+                    }
+                    else if (typeRef.ResolutionScope.Kind == HandleKind.ModuleDefinition && typeDef.GetDeclaringType().IsNil)
+                    {
+                        typeDefHandle = tdh;
+                        break;
+                    }
+                    else
+                    {
+                        throw new NotSupportedException("Unrecognized ResolutionScope: " + typeRef.ResolutionScope);
+                    }
+                }
+            }
+
+            this.refToDefCache.Add(typeRefHandle, typeDefHandle);
+            return !typeDefHandle.IsNil;
+        }
+
+        private bool TryGetTypeDefHandle(TypeSyntax typeSyntax, out TypeDefinitionHandle typeDefHandle)
+        {
+            string typeName = typeSyntax.ToString();
             return this.typesByName.TryGetValue(typeName, out typeDefHandle);
         }
 
@@ -1908,7 +1964,7 @@ namespace Microsoft.Windows.CsWin32
         /// COM interfaces are represented as structs in order to maintain the "unmanaged type" trait
         /// so that all structs are blittable.
         /// </remarks>
-        private TypeDeclarationSyntax? CreateInterface(TypeDefinition typeDef)
+        private TypeDeclarationSyntax? DeclareInterface(TypeDefinition typeDef)
         {
             IdentifierNameSyntax ifaceName = IdentifierName(this.mr.GetString(typeDef.Name));
 
@@ -1917,8 +1973,7 @@ namespace Microsoft.Windows.CsWin32
             while (!baseTypeHandle.IsNil)
             {
                 InterfaceImplementation baseTypeImpl = this.mr.GetInterfaceImplementation(baseTypeHandle);
-                TypeReference baseTypeRef = this.mr.GetTypeReference((TypeReferenceHandle)baseTypeImpl.Interface);
-                if (!this.TryGetTypeDefHandle(baseTypeRef, out TypeDefinitionHandle baseTypeDefHandle))
+                if (!this.TryGetTypeDefHandle((TypeReferenceHandle)baseTypeImpl.Interface, out TypeDefinitionHandle baseTypeDefHandle))
                 {
                     throw new GenerationFailedException("Failed to find base type.");
                 }
@@ -1928,9 +1983,17 @@ namespace Microsoft.Windows.CsWin32
                 baseTypeHandle = baseType.GetInterfaceImplementations().SingleOrDefault();
             }
 
+            return this.options.ComInterop.StructsInsteadOfInterfaces
+                ? this.DeclareInterfaceAsStruct(typeDef, ifaceName, baseTypes)
+                : this.DeclareInterfaceAsInterface(typeDef, ifaceName, baseTypes);
+        }
+
+        private TypeDeclarationSyntax DeclareInterfaceAsStruct(TypeDefinition typeDef, IdentifierNameSyntax ifaceName, Stack<TypeDefinitionHandle> baseTypes)
+        {
             IdentifierNameSyntax vtblFieldName = IdentifierName("lpVtbl");
             var members = new List<MemberDeclarationSyntax>();
             var vtblMembers = new List<MemberDeclarationSyntax>();
+            TypeSyntaxParameters typeSettings = this.comSignatureTypeSettings;
 
             // It is imperative that we generate methods for all base interfaces as well, ahead of any implemented by *this* interface.
             var allMethods = new List<MethodDefinitionHandle>();
@@ -1949,17 +2012,21 @@ namespace Microsoft.Windows.CsWin32
                 string methodName = this.mr.GetString(methodDefinition.Name);
                 IdentifierNameSyntax innerMethodName = IdentifierName($"{methodName}_{methodCounter}");
 
-                MethodSignature<TypeSyntax> signature = methodDefinition.DecodeSignature(this.signatureTypeProviderNoMarshaledTypes, null);
+                MethodSignature<TypeHandleInfo> signature = methodDefinition.DecodeSignature(SignatureHandleProvider.Instance, null);
                 CustomAttributeHandleCollection? returnTypeAttributes = this.GetReturnTypeCustomAttributes(methodDefinition);
 
-                TypeSyntax returnType = signature.ReturnType;
+                TypeSyntax returnType;
                 AttributeSyntax? returnTypeAttribute = null;
                 if (returnTypeAttributes.HasValue)
                 {
-                    (returnType, returnTypeAttribute) = this.ReinterpretMethodSignatureType(signature.ReturnType, returnTypeAttributes.Value, isReturnOrOutParam: true);
+                    (returnType, returnTypeAttribute) = this.ReinterpretMethodSignatureType(signature.ReturnType, returnTypeAttributes.Value, isReturnOrOutParam: true, typeSettings);
+                }
+                else
+                {
+                    returnType = signature.ReturnType.ToTypeSyntax(typeSettings);
                 }
 
-                ParameterListSyntax parameterList = this.CreateParameterList(methodDefinition, signature);
+                ParameterListSyntax parameterList = this.CreateParameterList(methodDefinition, signature, typeSettings);
                 FunctionPointerParameterListSyntax funcPtrParameters = FunctionPointerParameterList()
                     .AddParameters(FunctionPointerParameter(PointerType(ifaceName)))
                     .AddParameters(parameterList.Parameters.Select(p => FunctionPointerParameter(p.Type!).WithModifiers(p.Modifiers)).ToArray())
@@ -2010,15 +2077,15 @@ namespace Microsoft.Windows.CsWin32
                     methodDeclaration = methodDeclaration.AddModifiers(Token(SyntaxKind.NewKeyword));
                 }
 
-                // Add documentation if we can find it.
-                methodDeclaration = AddApiDocumentation($"{ifaceName}.{methodName}", methodDeclaration);
-
                 if (methodDeclaration.ReturnType is PointerTypeSyntax || methodDeclaration.ParameterList.Parameters.Any(p => p.Type is PointerTypeSyntax))
                 {
                     methodDeclaration = methodDeclaration.AddModifiers(Token(SyntaxKind.UnsafeKeyword));
                 }
 
-                members.AddRange(this.CreateFriendlyOverloads(methodDefinition, methodDeclaration, ifaceName.Identifier.ValueText, isStatic: false));
+                // Add documentation if we can find it.
+                methodDeclaration = AddApiDocumentation($"{ifaceName}.{methodName}", methodDeclaration);
+
+                members.AddRange(this.DeclareFriendlyOverloads(methodDefinition, methodDeclaration, ifaceName.Identifier.ValueText, isStatic: false));
                 members.Add(methodDeclaration);
             }
 
@@ -2030,17 +2097,155 @@ namespace Microsoft.Windows.CsWin32
             // private Vtbl* lpVtbl;
             members.Add(FieldDeclaration(VariableDeclaration(PointerType(IdentifierName(vtblStruct.Identifier))).AddVariables(VariableDeclarator(vtblFieldName.Identifier))).AddModifiers(Token(SyntaxKind.PrivateKeyword)));
 
-            var iface = StructDeclaration(ifaceName.Identifier)
-                .AddMembers(members.ToArray())
-                .AddModifiers(Token(this.Visibility), Token(SyntaxKind.UnsafeKeyword));
-
-            Guid guid = this.FindGuidFromAttribute(typeDef);
-            if (guid != Guid.Empty)
-            {
-                iface = iface.AddAttributeLists().AddAttributeLists(AttributeList().AddAttributes(GUID(guid)));
-            }
+            StructDeclarationSyntax iface = StructDeclaration(ifaceName.Identifier)
+                .AddAttributeLists(AttributeList().AddAttributes(GUID(this.FindGuidFromAttribute(typeDef))))
+                .AddModifiers(Token(this.Visibility), Token(SyntaxKind.UnsafeKeyword))
+                .AddMembers(members.ToArray());
 
             return iface;
+        }
+
+        private TypeDeclarationSyntax? DeclareInterfaceAsInterface(TypeDefinition typeDef, IdentifierNameSyntax ifaceName, Stack<TypeDefinitionHandle> baseTypes)
+        {
+            if (ifaceName.Identifier.ValueText is "IUnknown" or "IDispatch")
+            {
+                // We do not generate interfaces for these COM base types.
+                return null;
+            }
+
+            TypeSyntaxParameters typeSettings = this.comSignatureTypeSettings;
+
+            // It is imperative that we generate methods for all base interfaces as well, ahead of any implemented by *this* interface.
+            AttributeSyntax? ifaceType = null;
+            var allMethods = new List<MethodDefinitionHandle>();
+            var baseTypeSyntaxList = new List<BaseTypeSyntax>();
+            while (baseTypes.Count > 0)
+            {
+                TypeDefinitionHandle baseTypeHandle = baseTypes.Pop();
+                TypeDefinition baseType = this.mr.GetTypeDefinition(baseTypeHandle);
+                if (ifaceType is null)
+                {
+                    ifaceType = InterfaceType(
+                        this.mr.StringComparer.Equals(baseType.Name, "IUnknown") ? ComInterfaceType.InterfaceIsIUnknown :
+                        this.mr.StringComparer.Equals(baseType.Name, "IDispatch") ? ComInterfaceType.InterfaceIsIDispatch :
+                        throw new NotSupportedException("Unsupported base COM interface type: " + this.mr.GetString(baseType.Name)));
+                }
+                else
+                {
+                    this.RequestInteropType(baseTypeHandle);
+                    baseTypeSyntaxList.Add(SimpleBaseType(new HandleTypeHandleInfo(baseTypeHandle).ToTypeSyntax(this.generalTypeSettings)));
+                    allMethods.AddRange(baseType.GetMethods());
+                }
+            }
+
+            int inheritedMethods = allMethods.Count;
+            allMethods.AddRange(typeDef.GetMethods());
+
+            if (ifaceType is null)
+            {
+                throw new NotSupportedException("No COM interface base type found.");
+            }
+
+            var members = new List<MemberDeclarationSyntax>();
+
+            foreach (MethodDefinitionHandle methodDefHandle in allMethods)
+            {
+                var methodDefinition = this.mr.GetMethodDefinition(methodDefHandle);
+                string methodName = this.mr.GetString(methodDefinition.Name);
+                try
+                {
+                    IdentifierNameSyntax innerMethodName = IdentifierName(methodName);
+                    MethodSignature<TypeHandleInfo> signature = methodDefinition.DecodeSignature(SignatureHandleProvider.Instance, null);
+                    CustomAttributeHandleCollection? returnTypeAttributes = this.GetReturnTypeCustomAttributes(methodDefinition);
+
+                    TypeSyntax returnType;
+                    AttributeSyntax? returnTypeAttribute = null;
+                    if (returnTypeAttributes.HasValue)
+                    {
+                        (returnType, returnTypeAttribute) = this.ReinterpretMethodSignatureType(signature.ReturnType, returnTypeAttributes.Value, isReturnOrOutParam: true, typeSettings);
+                    }
+                    else
+                    {
+                        returnType = signature.ReturnType.ToTypeSyntax(typeSettings);
+                    }
+
+                    bool preserveSig = returnType is not IdentifierNameSyntax { Identifier: { ValueText: "HRESULT" } }
+                        || this.options.ComInterop.PreserveSigMethods.Contains($"{ifaceName}.{methodName}")
+                        || this.options.ComInterop.PreserveSigMethods.Contains(ifaceName.ToString());
+
+                    var parameterList = this.CreateParameterList(methodDefinition, signature, this.comSignatureTypeSettings);
+
+                    if (!preserveSig)
+                    {
+                        ParameterSyntax? lastParameter = parameterList.Parameters.Count > 0 ? parameterList.Parameters[parameterList.Parameters.Count - 1] : null;
+                        if (lastParameter?.HasAnnotation(IsRetValAnnotation) is true)
+                        {
+                            // Move the retval parameter to the return value position.
+                            parameterList = parameterList.WithParameters(parameterList.Parameters.RemoveAt(parameterList.Parameters.Count - 1));
+                            returnType = lastParameter.Modifiers.Any(SyntaxKind.OutKeyword) ? lastParameter.Type! : ((PointerTypeSyntax)lastParameter.Type!).ElementType;
+                            returnTypeAttribute = lastParameter.DescendantNodes().OfType<AttributeSyntax>().FirstOrDefault(att => att.Name.ToString() == "MarshalAs");
+                        }
+                        else
+                        {
+                            // Remove the return type
+                            returnType = PredefinedType(Token(SyntaxKind.VoidKeyword));
+                            returnTypeAttribute = null;
+                        }
+                    }
+
+                    MethodDeclarationSyntax methodDeclaration = MethodDeclaration(returnType, SafeIdentifier(methodName))
+                        .WithParameterList(parameterList)
+                        .WithSemicolonToken(Token(SyntaxKind.SemicolonToken));
+                    if (returnTypeAttribute is object)
+                    {
+                        methodDeclaration = methodDeclaration.AddAttributeLists(
+                            AttributeList().WithTarget(AttributeTargetSpecifier(Token(SyntaxKind.ReturnKeyword))).AddAttributes(returnTypeAttribute));
+                    }
+
+                    if (preserveSig)
+                    {
+                        methodDeclaration = methodDeclaration.AddAttributeLists(AttributeList().AddAttributes(PreserveSigAttribute));
+                    }
+
+                    if (returnTypeAttribute is object)
+                    {
+                        methodDeclaration = methodDeclaration.AddAttributeLists(
+                            AttributeList().WithTarget(AttributeTargetSpecifier(Token(SyntaxKind.ReturnKeyword))).AddAttributes(returnTypeAttribute));
+                    }
+
+                    if (inheritedMethods-- > 0)
+                    {
+                        methodDeclaration = methodDeclaration.AddModifiers(Token(SyntaxKind.NewKeyword));
+                    }
+
+                    if (methodDeclaration.ReturnType is PointerTypeSyntax || methodDeclaration.ParameterList.Parameters.Any(p => p.Type is PointerTypeSyntax))
+                    {
+                        methodDeclaration = methodDeclaration.AddModifiers(Token(SyntaxKind.UnsafeKeyword));
+                    }
+
+                    // Add documentation if we can find it.
+                    methodDeclaration = AddApiDocumentation($"{ifaceName}.{methodName}", methodDeclaration);
+                    members.Add(methodDeclaration);
+                }
+                catch (Exception ex)
+                {
+                    throw new GenerationFailedException($"Failed while generating the method: {methodName}", ex);
+                }
+            }
+
+            Guid guid = this.FindGuidFromAttribute(typeDef);
+            InterfaceDeclarationSyntax ifaceDeclaration = InterfaceDeclaration(ifaceName.Identifier)
+                .AddAttributeLists(AttributeList().AddAttributes(GUID(guid), ifaceType))
+                .AddModifiers(Token(this.Visibility))
+                .AddMembers(members.ToArray());
+
+            if (baseTypeSyntaxList.Count > 0)
+            {
+                ifaceDeclaration = ifaceDeclaration
+                    .AddBaseListTypes(baseTypeSyntaxList.ToArray());
+            }
+
+            return ifaceDeclaration;
         }
 
         private Guid FindGuidFromAttribute(TypeDefinition typeDef)
@@ -2070,9 +2275,10 @@ namespace Microsoft.Windows.CsWin32
             return guid;
         }
 
-        private DelegateDeclarationSyntax CreateInteropDelegate(TypeDefinition typeDef)
+        private DelegateDeclarationSyntax DeclareInteropDelegate(TypeDefinition typeDef)
         {
             string name = this.mr.GetString(typeDef.Name);
+            TypeSyntaxParameters typeSettings = this.delegateSignatureTypeSettings;
 
             CallingConvention? callingConvention = null;
             foreach (CustomAttributeHandle handle in typeDef.GetCustomAttributes())
@@ -2085,10 +2291,10 @@ namespace Microsoft.Windows.CsWin32
                 }
             }
 
-            this.GetSignatureForDelegate(typeDef, this.signatureTypeProvider, out MethodDefinition invokeMethodDef, out MethodSignature<TypeSyntax> signature);
+            this.GetSignatureForDelegate(typeDef, out MethodDefinition invokeMethodDef, out MethodSignature<TypeHandleInfo> signature);
 
-            DelegateDeclarationSyntax result = DelegateDeclaration(signature.ReturnType, name)
-                .WithParameterList(this.CreateParameterList(invokeMethodDef, signature))
+            DelegateDeclarationSyntax result = DelegateDeclaration(signature.ReturnType.ToTypeSyntax(typeSettings), name)
+                .WithParameterList(this.CreateParameterList(invokeMethodDef, signature, typeSettings))
                 .AddModifiers(Token(this.Visibility), Token(SyntaxKind.UnsafeKeyword));
 
             if (callingConvention.HasValue)
@@ -2099,15 +2305,16 @@ namespace Microsoft.Windows.CsWin32
             return result;
         }
 
-        private void GetSignatureForDelegate(TypeDefinition typeDef, SignatureTypeProvider signatureTypeProvider, out MethodDefinition invokeMethodDef, out MethodSignature<TypeSyntax> signature)
+        private void GetSignatureForDelegate(TypeDefinition typeDef, out MethodDefinition invokeMethodDef, out MethodSignature<TypeHandleInfo> signature)
         {
             invokeMethodDef = typeDef.GetMethods().Select(this.mr.GetMethodDefinition).Single(def => this.mr.StringComparer.Equals(def.Name, "Invoke"));
-            signature = invokeMethodDef.DecodeSignature(signatureTypeProvider, null);
+            signature = invokeMethodDef.DecodeSignature(SignatureHandleProvider.Instance, null);
         }
 
-        private StructDeclarationSyntax CreateInteropStruct(TypeDefinition typeDef)
+        private StructDeclarationSyntax DeclareInteropStruct(TypeDefinition typeDef)
         {
             IdentifierNameSyntax name = IdentifierName(this.mr.GetString(typeDef.Name));
+            TypeSyntaxParameters typeSettings = this.fieldTypeSettings;
 
             var members = new List<MemberDeclarationSyntax>();
             foreach (FieldDefinitionHandle fieldDefHandle in typeDef.GetFields())
@@ -2144,8 +2351,8 @@ namespace Microsoft.Windows.CsWin32
                 }
                 else
                 {
-                    var fieldInfo = this.ReinterpretFieldType(fieldDef, fieldDeclarator.Identifier.ValueText, fieldDef.DecodeSignature(this.signatureTypeProviderNoMarshaledTypes, null), fieldDef.GetCustomAttributes());
-                    (_, additionalMembers) = fieldInfo;
+                    var fieldInfo = this.ReinterpretFieldType(fieldDef, fieldDeclarator.Identifier.ValueText, fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null).ToTypeSyntax(typeSettings), fieldDef.GetCustomAttributes());
+                    additionalMembers = fieldInfo.AdditionalMembers;
 
                     field = FieldDeclaration(VariableDeclaration(fieldInfo.FieldType).AddVariables(fieldDeclarator))
                         .AddModifiers(Token(this.Visibility));
@@ -2195,12 +2402,12 @@ namespace Microsoft.Windows.CsWin32
         /// <summary>
         /// Creates a struct that emulates a typedef in the C language headers.
         /// </summary>
-        private StructDeclarationSyntax CreateTypeDefStruct(TypeDefinition typeDef)
+        private StructDeclarationSyntax DeclareTypeDefStruct(TypeDefinition typeDef)
         {
             IdentifierNameSyntax name = IdentifierName(this.mr.GetString(typeDef.Name));
             if (name.Identifier.ValueText == "BOOL")
             {
-                return this.CreateTypeDefBOOLStruct(typeDef);
+                return this.DeclareTypeDefBOOLStruct(typeDef);
             }
 
             bool isHandle = false;
@@ -2223,14 +2430,14 @@ namespace Microsoft.Windows.CsWin32
                 }
             }
 
-            SignatureTypeProvider signatureTypeProvider = isHandle ? this.signatureTypeProviderAlwaysUseIntPtr : this.signatureTypeProvider;
+            TypeSyntaxParameters typeSettings = isHandle ? this.fieldOfHandleTypeDefTypeSettings : this.fieldTypeSettings;
 
             FieldDefinition fieldDef = this.mr.GetFieldDefinition(typeDef.GetFields().Single());
             string fieldName = this.mr.GetString(fieldDef.Name);
             IdentifierNameSyntax fieldIdentifierName = SafeIdentifierName(fieldName);
             VariableDeclaratorSyntax fieldDeclarator = VariableDeclarator(fieldIdentifierName.Identifier);
             (TypeSyntax FieldType, SyntaxList<MemberDeclarationSyntax> AdditionalMembers) fieldInfo =
-                this.ReinterpretFieldType(fieldDef, fieldDeclarator.Identifier.ValueText, fieldDef.DecodeSignature(signatureTypeProvider, null), fieldDef.GetCustomAttributes());
+                this.ReinterpretFieldType(fieldDef, fieldDeclarator.Identifier.ValueText, fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null).ToTypeSyntax(typeSettings), fieldDef.GetCustomAttributes());
             SyntaxList<MemberDeclarationSyntax> members = List<MemberDeclarationSyntax>();
 
             FieldDeclarationSyntax fieldSyntax = FieldDeclaration(
@@ -2488,7 +2695,7 @@ namespace Microsoft.Windows.CsWin32
 #pragma warning restore SA1114 // Parameter list should follow declaration
         }
 
-        private StructDeclarationSyntax CreateTypeDefBOOLStruct(TypeDefinition typeDef)
+        private StructDeclarationSyntax DeclareTypeDefBOOLStruct(TypeDefinition typeDef)
         {
             IdentifierNameSyntax name = IdentifierName("BOOL");
 
@@ -2496,7 +2703,7 @@ namespace Microsoft.Windows.CsWin32
             string fieldName = this.mr.GetString(fieldDef.Name);
             VariableDeclaratorSyntax fieldDeclarator = VariableDeclarator("value");
             (TypeSyntax FieldType, SyntaxList<MemberDeclarationSyntax> AdditionalMembers) fieldInfo =
-                this.ReinterpretFieldType(fieldDef, fieldDeclarator.Identifier.ValueText, fieldDef.DecodeSignature(this.signatureTypeProvider, null), fieldDef.GetCustomAttributes());
+                this.ReinterpretFieldType(fieldDef, fieldDeclarator.Identifier.ValueText, fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null).ToTypeSyntax(this.fieldTypeSettings), fieldDef.GetCustomAttributes());
             SyntaxList<MemberDeclarationSyntax> members = List<MemberDeclarationSyntax>();
 
             FieldDeclarationSyntax fieldSyntax = FieldDeclaration(
@@ -2541,7 +2748,7 @@ namespace Microsoft.Windows.CsWin32
             return result;
         }
 
-        private EnumDeclarationSyntax CreateInteropEnum(TypeDefinition typeDef)
+        private EnumDeclarationSyntax DeclareInteropEnum(TypeDefinition typeDef)
         {
             bool flagsEnum = false;
             foreach (CustomAttributeHandle attributeHandle in typeDef.GetCustomAttributes())
@@ -2563,7 +2770,7 @@ namespace Microsoft.Windows.CsWin32
                 ConstantHandle valueHandle = fieldDef.GetDefaultValue();
                 if (valueHandle.IsNil)
                 {
-                    enumBaseType = fieldDef.DecodeSignature(this.signatureTypeProvider, null);
+                    enumBaseType = fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null).ToTypeSyntax(this.enumTypeSettings);
                     continue;
                 }
 
@@ -2601,14 +2808,14 @@ namespace Microsoft.Windows.CsWin32
             return result;
         }
 
-        private IEnumerable<MethodDeclarationSyntax> CreateFriendlyOverloads(MethodDefinition methodDefinition, MethodDeclarationSyntax externMethodDeclaration, string declaringTypeName, bool isStatic)
+        private IEnumerable<MethodDeclarationSyntax> DeclareFriendlyOverloads(MethodDefinition methodDefinition, MethodDeclarationSyntax externMethodDeclaration, string declaringTypeName, bool isStatic)
         {
 #pragma warning disable SA1114 // Parameter list should follow declaration
             static ParameterSyntax StripAttributes(ParameterSyntax parameter) => parameter.WithAttributeLists(List<AttributeListSyntax>());
-            bool IsInterface(string name) => this.typesByName.TryGetValue(name, out TypeDefinitionHandle tdh) && (this.mr.GetTypeDefinition(tdh).Attributes & TypeAttributes.Interface) == TypeAttributes.Interface;
             static ExpressionSyntax GetSpanLength(ExpressionSyntax span) => MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, span, IdentifierName(nameof(Span<int>.Length)));
             bool isReleaseMethod = this.releaseMethods.Contains(externMethodDeclaration.Identifier.ValueText);
 
+            var originalSignature = methodDefinition.DecodeSignature(SignatureHandleProvider.Instance, null);
             var parameters = externMethodDeclaration.ParameterList.Parameters.Select(StripAttributes).ToList();
             var lengthParamUsedBy = new Dictionary<int, int>();
             var arguments = externMethodDeclaration.ParameterList.Parameters.Select(p => Argument(IdentifierName(p.Identifier.Text))).ToList();
@@ -2636,14 +2843,14 @@ namespace Microsoft.Windows.CsWin32
                 // * Review double/triple pointer scenarios.
                 //   * Consider CredEnumerateA, which is a "pointer to an array of pointers" (3-asterisks!). How does FriendlyAttribute improve this, if at all? The memory must be freed through another p/invoke.
                 ParameterSyntax externParam = parameters[param.SequenceNumber - 1];
-                if (this.IsManagedType(externParam.Type) && (externParam.Modifiers.Any(SyntaxKind.OutKeyword) || externParam.Modifiers.Any(SyntaxKind.RefKeyword)))
+                if (this.IsManagedType(originalSignature.ParameterTypes[param.SequenceNumber - 1]) && (externParam.Modifiers.Any(SyntaxKind.OutKeyword) || externParam.Modifiers.Any(SyntaxKind.RefKeyword)))
                 {
                     bool hasOut = externParam.Modifiers.Any(SyntaxKind.OutKeyword);
                     arguments[param.SequenceNumber - 1] = arguments[param.SequenceNumber - 1].WithRefKindKeyword(Token(hasOut ? SyntaxKind.OutKeyword : SyntaxKind.RefKeyword));
                 }
                 else if (isOut && !isIn && !isReleaseMethod && externParam.Type is PointerTypeSyntax { ElementType: IdentifierNameSyntax outTypeId } && this.TryGetHandleReleaseMethod(outTypeId.Identifier.ValueText, out string? outReleaseMethod) && !this.mr.StringComparer.Equals(methodDefinition.Name, outReleaseMethod))
                 {
-                    if (this.GenerateSafeHandle(outReleaseMethod) is TypeSyntax safeHandleType)
+                    if (this.RequestSafeHandle(outReleaseMethod) is TypeSyntax safeHandleType)
                     {
                         signatureChanged = true;
 
@@ -2719,7 +2926,7 @@ namespace Microsoft.Windows.CsWin32
                 }
                 else if (externParam.Type is PointerTypeSyntax ptrType
                     && !IsVoid(ptrType.ElementType)
-                    && !(ptrType.ElementType is IdentifierNameSyntax id && IsInterface(id.Identifier.ValueText)))
+                    && !(ptrType.ElementType is IdentifierNameSyntax id && this.IsInterface(id.Identifier.ValueText)))
                 {
                     bool isPointerToPointer = ptrType.ElementType is PointerTypeSyntax;
 
@@ -2899,7 +3106,7 @@ namespace Microsoft.Windows.CsWin32
 
             TypeSyntax? returnSafeHandleType = externMethodDeclaration.ReturnType is IdentifierNameSyntax returnType
                 && this.TryGetHandleReleaseMethod(returnType.Identifier.ValueText, out string? returnReleaseMethod)
-                ? this.GenerateSafeHandle(returnReleaseMethod) : null;
+                ? this.RequestSafeHandle(returnReleaseMethod) : null;
             SyntaxToken friendlyMethodName = externMethodDeclaration.Identifier;
 
             if (returnSafeHandleType is object && !signatureChanged)
@@ -3054,17 +3261,17 @@ namespace Microsoft.Windows.CsWin32
             return moduleName;
         }
 
-        private ParameterListSyntax CreateParameterList(MethodDefinition methodDefinition, MethodSignature<TypeSyntax> signature)
-            => ParameterList().AddParameters(methodDefinition.GetParameters().Select(this.mr.GetParameter).Where(p => !p.Name.IsNil).Select(p => this.CreateParameter(signature, p)).ToArray());
+        private ParameterListSyntax CreateParameterList(MethodDefinition methodDefinition, MethodSignature<TypeHandleInfo> signature, TypeSyntaxParameters typeSettings)
+            => ParameterList().AddParameters(methodDefinition.GetParameters().Select(this.mr.GetParameter).Where(p => !p.Name.IsNil).Select(p => this.CreateParameter(signature.ParameterTypes[p.SequenceNumber - 1], p, typeSettings)).ToArray());
 
-        private ParameterSyntax CreateParameter(MethodSignature<TypeSyntax> methodSignature, Parameter parameter)
+        private ParameterSyntax CreateParameter(TypeHandleInfo parameterType, Parameter parameter, TypeSyntaxParameters typeSettings)
         {
             string name = this.mr.GetString(parameter.Name);
 
             // TODO:
             // * Notice [Out][RAIIFree] handle producing parameters. Can we make these provide SafeHandle's?
             bool isReturnOrOutParam = parameter.SequenceNumber == 0 || (parameter.Attributes & ParameterAttributes.Out) == ParameterAttributes.Out;
-            var parameterInfo = this.ReinterpretMethodSignatureType(methodSignature.ParameterTypes[parameter.SequenceNumber - 1], parameter.GetCustomAttributes(), isReturnOrOutParam);
+            var parameterInfo = this.ReinterpretMethodSignatureType(parameterType, parameter.GetCustomAttributes(), isReturnOrOutParam, typeSettings);
 
             // Determine the custom attributes to apply.
             var attributes = AttributeList();
@@ -3095,20 +3302,23 @@ namespace Microsoft.Windows.CsWin32
                 (parameter.Attributes & ParameterAttributes.Out) == ParameterAttributes.Out ? SyntaxKind.OutKeyword :
                 (parameter.Attributes & (ParameterAttributes.In | ParameterAttributes.Out)) == (ParameterAttributes.In | ParameterAttributes.Out) ? SyntaxKind.RefKeyword :
                 default;
-            if (parameterInfo.Type is PointerTypeSyntax { ElementType: TypeSyntax ptrElem1 } && this.IsManagedType(ptrElem1))
+            if (parameterType is PointerTypeHandleInfo { ElementType: HandleTypeHandleInfo ptrElem1 } && this.IsManagedType(ptrElem1))
             {
                 // Strip the pointer, leave the delegate name.
-                parameterInfo = (ptrElem1, null);
+                parameterInfo = (((PointerTypeSyntax)parameterInfo.Type).ElementType, null);
                 attributes = AttributeList(); // remove in/out/ref attributes
                 modifiers = modifiers.Add(Token(directionalModifier != SyntaxKind.None ? directionalModifier : SyntaxKind.RefKeyword));
             }
-            else if (parameterInfo.Type is PointerTypeSyntax { ElementType: PointerTypeSyntax { ElementType: TypeSyntax ptrElem2 } } && this.IsManagedType(ptrElem2))
+            else if (parameterType is PointerTypeHandleInfo { ElementType: PointerTypeHandleInfo { ElementType: HandleTypeHandleInfo ptrElem2 } })
             {
-                // This is a pointer to a pointer to a managed object. We need to strip the pointers and add a ref or out modifier.
-                // TODO: Is this actually a ref/out to an ARRAY of managed objects?
-                parameterInfo = (ptrElem2, null);
-                attributes = AttributeList(); // remove in/out/ref attributes
-                modifiers = modifiers.Add(Token(directionalModifier != SyntaxKind.None ? directionalModifier : SyntaxKind.RefKeyword));
+                if (this.IsManagedType(ptrElem2))
+                {
+                    // This is a pointer to a pointer to a managed object. We need to strip the pointers and add a ref or out modifier.
+                    // TODO: Is this actually a ref/out to an ARRAY of managed objects?
+                    parameterInfo = (((PointerTypeSyntax)((PointerTypeSyntax)parameterInfo.Type).ElementType).ElementType, null);
+                    attributes = AttributeList(); // remove in/out/ref attributes
+                    modifiers = modifiers.Add(Token(directionalModifier != SyntaxKind.None ? directionalModifier : SyntaxKind.RefKeyword));
+                }
             }
 
             ParameterSyntax parameterSyntax = Parameter(
@@ -3124,38 +3334,46 @@ namespace Microsoft.Windows.CsWin32
                     .AddAttributeLists(AttributeList().AddAttributes(parameterInfo.MarshalAsAttribute));
             }
 
+            if (parameter.GetCustomAttributes().Any(h => this.IsAttribute(this.mr.GetCustomAttribute(h), InteropDecorationNamespace, "RetValAttribute")))
+            {
+                parameterSyntax = parameterSyntax.WithAdditionalAnnotations(IsRetValAnnotation);
+            }
+
             return parameterSyntax;
         }
 
-        private (TypeSyntax Type, AttributeSyntax? MarshalAsAttribute) ReinterpretMethodSignatureType(TypeSyntax originalType, CustomAttributeHandleCollection customAttributes, bool isReturnOrOutParam)
+        private (TypeSyntax Type, AttributeSyntax? MarshalAsAttribute) ReinterpretMethodSignatureType(TypeHandleInfo originalType, CustomAttributeHandleCollection customAttributes, bool isReturnOrOutParam, TypeSyntaxParameters typeSettings)
         {
-            if (originalType is PointerTypeSyntax { ElementType: IdentifierNameSyntax idName } && this.IsDelegateReference(idName, out TypeDefinition delegateTypeDef))
+            if (originalType is PointerTypeHandleInfo { ElementType: HandleTypeHandleInfo pointedElement } && this.IsDelegateReference(pointedElement, out TypeDefinition delegateTypeDef))
             {
                 return (this.FunctionPointer(delegateTypeDef), null);
             }
 
-            if (!isReturnOrOutParam && originalType.HasAnnotation(IsSafeHandleTypeAnnotation))
+            TypeSyntax originalTypeSyntax = originalType.ToTypeSyntax(typeSettings);
+            if (!isReturnOrOutParam && originalTypeSyntax.HasAnnotation(IsSafeHandleTypeAnnotation))
             {
                 return (SafeHandleTypeSyntax, null);
             }
 
-            if (originalType is IdentifierNameSyntax { Identifier: { ValueText: "PWSTR" or "PSTR" } id })
+            if (originalTypeSyntax is IdentifierNameSyntax { Identifier: { ValueText: "PWSTR" or "PSTR" } id })
             {
                 bool isConst = customAttributes.Any(ah => this.IsAttribute(this.mr.GetCustomAttribute(ah), InteropDecorationNamespace, "ConstAttribute"));
                 if (isConst)
                 {
                     IdentifierNameSyntax constantTypeIdentifierName = IdentifierName("PC" + id.ValueText.Substring(1));
 
-                    this.GenerateTypeDefStruct(constantTypeIdentifierName.Identifier.ValueText);
+                    this.RequestTypeDefStruct(constantTypeIdentifierName.Identifier.ValueText);
                     return (constantTypeIdentifierName, null);
                 }
             }
 
-            return (originalType, null);
+            return (originalTypeSyntax, null);
         }
 
         private (TypeSyntax FieldType, SyntaxList<MemberDeclarationSyntax> AdditionalMembers) ReinterpretFieldType(FieldDefinition fieldDef, string fieldName, TypeSyntax originalType, CustomAttributeHandleCollection customAttributes)
         {
+            TypeSyntaxParameters typeSettings = this.fieldTypeSettings;
+
             ExpressionSyntax GetHiddenFieldAccess() => MemberAccessExpression(
                 SyntaxKind.SimpleMemberAccessExpression,
                 ThisExpression(),
@@ -3293,7 +3511,7 @@ namespace Microsoft.Windows.CsWin32
                 IdentifierNameSyntax indexParamName = IdentifierName("index");
                 IdentifierNameSyntax p0 = IdentifierName("p0");
                 IdentifierNameSyntax atThis = IdentifierName("@this");
-                TypeSyntax qualifiedElementType = elementType == IntPtrTypeSyntax ? elementType : ((ArrayTypeSyntax)fieldDef.DecodeSignature(this.signatureTypeProviderFullyQualified, null)).ElementType;
+                TypeSyntax qualifiedElementType = elementType == IntPtrTypeSyntax ? elementType : ((ArrayTypeSyntax)fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null).ToTypeSyntax(typeSettings)).ElementType;
 
                 ////internal static unsafe ref readonly uint ReadOnlyItemRef(this in MainAVIHeader.__dwReserved_4 @this, int index)
                 ////{
@@ -3308,7 +3526,7 @@ namespace Microsoft.Windows.CsWin32
                                 MemberAccessExpression(SyntaxKind.SimpleMemberAccessExpression, atThis, firstElementFieldName))))),
                     ReturnStatement(RefExpression(ElementAccessExpression(p0).AddArgumentListArguments(Argument(indexParamName)))));
                 BlockSyntax body = Block().AddStatements(fixedStatement);
-                ParameterSyntax thisParameter = Parameter(atThis.Identifier).WithType(QualifiedName(this.GetQualifiedName(fieldDef.GetDeclaringType()), fixedLengthStructName)).AddModifiers(Token(SyntaxKind.ThisKeyword));
+                ParameterSyntax thisParameter = Parameter(atThis.Identifier).WithType(QualifiedName((NameSyntax)new HandleTypeHandleInfo(fieldDef.GetDeclaringType()).ToTypeSyntax(this.extensionMethodSignatureTypeSettings), fixedLengthStructName)).AddModifiers(Token(SyntaxKind.ThisKeyword));
                 ParameterSyntax indexParameter = Parameter(indexParamName.Identifier).WithType(PredefinedType(Token(SyntaxKind.IntKeyword)));
                 SyntaxTokenList methodModifiers = TokenList(Token(this.Visibility), Token(SyntaxKind.StaticKeyword), Token(SyntaxKind.UnsafeKeyword));
                 MethodDeclarationSyntax getAtMethod = MethodDeclaration(RefType(qualifiedElementType).WithReadOnlyKeyword(Token(SyntaxKind.ReadOnlyKeyword)), "ReadOnlyItemRef")
@@ -3331,14 +3549,24 @@ namespace Microsoft.Windows.CsWin32
                 return (fixedLengthStructName, List<MemberDeclarationSyntax>().Add(fixedLengthStruct));
             }
 
-            // If the field is a delegate type, we have to replace that with a native function pointer to avoid the struct becoming a 'managed type'.
-            if (originalType is PointerTypeSyntax { ElementType: IdentifierNameSyntax idName } && this.IsDelegateReference(idName, out TypeDefinition typeDef))
+            if (this.options.ComInterop.StructsInsteadOfInterfaces)
             {
-                return (this.FunctionPointer(typeDef), default);
+                // If the field is a delegate type, we have to replace that with a native function pointer to avoid the struct becoming a 'managed type'.
+                if (originalType is PointerTypeSyntax { ElementType: IdentifierNameSyntax idName } && this.IsDelegateReference(idName, out TypeDefinition typeDef))
+                {
+                    return (this.FunctionPointer(typeDef), default);
+                }
+                else if (originalType is IdentifierNameSyntax idName2 && this.IsDelegateReference(idName2, out typeDef))
+                {
+                    return (this.FunctionPointer(typeDef), default);
+                }
             }
-            else if (originalType is IdentifierNameSyntax idName2 && this.IsDelegateReference(idName2, out typeDef))
+
+            // If the field is a pointer to a COM interface (and we're using bona fide interfaces),
+            // then we must type it as an array.
+            if (originalType is PointerTypeSyntax { ElementType: TypeSyntax elementType2 } && this.IsManagedType(elementType2))
             {
-                return (this.FunctionPointer(typeDef), default);
+                return (ArrayType(elementType2), default);
             }
 
             return (originalType, default);
@@ -3350,13 +3578,11 @@ namespace Microsoft.Windows.CsWin32
             var attArgs = ufpAtt.DecodeValue(this.customAttributeTypeProvider);
             CallingConvention callingConvention = (CallingConvention)attArgs.FixedArguments[0].Value!;
 
-            this.GetSignatureForDelegate(delegateType, this.signatureTypeProviderNoMarshaledTypes, out MethodDefinition invokeMethodDef, out MethodSignature<TypeSyntax> signature);
+            this.GetSignatureForDelegate(delegateType, out MethodDefinition invokeMethodDef, out MethodSignature<TypeHandleInfo> signature);
             return this.FunctionPointer(CallingConvention.StdCall, signature, this.mr.GetString(delegateType.Name));
         }
 
         private bool IsDelegate(TypeDefinition typeDef) => (typeDef.Attributes & TypeAttributes.Class) == TypeAttributes.Class && typeDef.BaseType.Kind == HandleKind.TypeReference && this.mr.StringComparer.Equals(this.mr.GetTypeReference((TypeReferenceHandle)typeDef.BaseType).Name, nameof(MulticastDelegate));
-
-        private bool IsDelegateReference(IdentifierNameSyntax? identifierName) => this.IsDelegateReference(identifierName, out _);
 
         private bool IsTypeDefStruct(IdentifierNameSyntax? identifierName)
         {
@@ -3366,6 +3592,26 @@ namespace Microsoft.Windows.CsWin32
                 return this.IsTypeDefStruct(typeDef);
             }
 
+            return false;
+        }
+
+        private bool IsDelegateReference(HandleTypeHandleInfo typeHandle, out TypeDefinition delegateTypeDef)
+        {
+            if (typeHandle.Handle.Kind == HandleKind.TypeReference)
+            {
+                var trHandle = (TypeReferenceHandle)typeHandle.Handle;
+                TypeReference tr = this.mr.GetTypeReference(trHandle);
+                if (this.mr.StringComparer.Equals(tr.Name, nameof(MulticastDelegate)) && this.mr.StringComparer.Equals(tr.Namespace, nameof(System)))
+                {
+                    if (this.TryGetTypeDefHandle(trHandle, out TypeDefinitionHandle tdh))
+                    {
+                        delegateTypeDef = this.mr.GetTypeDefinition(tdh);
+                        return true;
+                    }
+                }
+            }
+
+            delegateTypeDef = default;
             return false;
         }
 
@@ -3384,16 +3630,139 @@ namespace Microsoft.Windows.CsWin32
             return false;
         }
 
-        private bool IsManagedType(TypeSyntax? identifierName)
+        private bool IsManagedType(TypeHandleInfo typeHandleInfo)
         {
-            if (identifierName is null)
+            TypeHandleInfo elementType =
+                typeHandleInfo is PointerTypeHandleInfo ptr ? ptr.ElementType :
+                typeHandleInfo is ArrayTypeHandleInfo array ? array.ElementType :
+                typeHandleInfo;
+            if (elementType is PointerTypeHandleInfo ptr2)
+            {
+                return this.IsManagedType(ptr2.ElementType);
+            }
+            else if (elementType is PrimitiveTypeHandleInfo)
             {
                 return false;
             }
+            else if (elementType is HandleTypeHandleInfo { Handle: { Kind: HandleKind.TypeDefinition } typeDefHandle })
+            {
+                return this.IsManagedType((TypeDefinitionHandle)typeDefHandle);
+            }
+            else if (elementType is HandleTypeHandleInfo { Handle: { Kind: HandleKind.TypeReference } typeRefHandle })
+            {
+                var trh = (TypeReferenceHandle)typeRefHandle;
+                if (this.TryGetTypeDefHandle(trh, out TypeDefinitionHandle tdr))
+                {
+                    return this.IsManagedType(tdr);
+                }
 
-            return identifierName.HasAnnotation(IsManagedTypeAnnotation)
-                || this.IsDelegateReference(identifierName as IdentifierNameSyntax);
+                TypeReference tr = this.mr.GetTypeReference(trh);
+                if (this.mr.StringComparer.Equals(tr.Name, "Guid"))
+                {
+                    return false;
+                }
+            }
+
+            throw new GenerationFailedException("Unrecognized type.");
         }
+
+        private bool IsManagedType(TypeDefinitionHandle typeDefinitionHandle)
+        {
+            var visitedTypes = new HashSet<TypeDefinitionHandle>();
+            return Helper(typeDefinitionHandle)!.Value;
+
+            bool? Helper(TypeDefinitionHandle typeDefinitionHandle)
+            {
+                if (!visitedTypes.Add(typeDefinitionHandle))
+                {
+                    // Avoid recursion. We just don't know the answer yet.
+                    return null;
+                }
+
+                TypeDefinition typeDef = this.mr.GetTypeDefinition(typeDefinitionHandle);
+                try
+                {
+                    if ((typeDef.Attributes & TypeAttributes.Interface) == TypeAttributes.Interface && !this.options.ComInterop.StructsInsteadOfInterfaces)
+                    {
+                        return true;
+                    }
+
+                    if (typeDef.BaseType.Kind == HandleKind.TypeReference)
+                    {
+                        TypeReference baseTypeRef = this.mr.GetTypeReference((TypeReferenceHandle)typeDef.BaseType);
+                        if (this.mr.StringComparer.Equals(baseTypeRef.Name, nameof(ValueType)) && this.mr.StringComparer.Equals(baseTypeRef.Namespace, nameof(System)))
+                        {
+                            if (this.IsTypeDefStruct(typeDef))
+                            {
+                                return false;
+                            }
+                            else
+                            {
+                                foreach (FieldDefinitionHandle fieldHandle in typeDef.GetFields())
+                                {
+                                    FieldDefinition fieldDef = this.mr.GetFieldDefinition(fieldHandle);
+                                    try
+                                    {
+                                        TypeHandleInfo elementType = fieldDef.DecodeSignature(SignatureHandleProvider.Instance, null);
+                                        while (elementType is ITypeHandleContainer container)
+                                        {
+                                            elementType = container.ElementType;
+                                        }
+
+                                        if (elementType is PrimitiveTypeHandleInfo)
+                                        {
+                                            // These are never managed.
+                                            continue;
+                                        }
+                                        else if (elementType is HandleTypeHandleInfo { Handle: { Kind: HandleKind.TypeDefinition } fieldTypeDefHandle })
+                                        {
+                                            if (Helper((TypeDefinitionHandle)fieldTypeDefHandle) is true)
+                                            {
+                                                return true;
+                                            }
+                                        }
+                                        else if (elementType is HandleTypeHandleInfo { Handle: { Kind: HandleKind.TypeReference } fieldTypeRefHandle })
+                                        {
+                                            if (this.TryGetTypeDefHandle((TypeReferenceHandle)fieldTypeRefHandle, out TypeDefinitionHandle tdr) && Helper(tdr) is true)
+                                            {
+                                                return true;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            throw new GenerationFailedException("Unrecognized type.");
+                                        }
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        throw new GenerationFailedException($"Unable to ascertain whether the {this.mr.GetString(fieldDef.Name)} field represents a managed type.", ex);
+                                    }
+                                }
+
+                                return false;
+                            }
+                        }
+                        else if (this.mr.StringComparer.Equals(baseTypeRef.Name, nameof(Enum)) && this.mr.StringComparer.Equals(baseTypeRef.Namespace, nameof(System)))
+                        {
+                            return false;
+                        }
+                        else if (this.mr.StringComparer.Equals(baseTypeRef.Name, nameof(MulticastDelegate)) && this.mr.StringComparer.Equals(baseTypeRef.Namespace, nameof(System)))
+                        {
+                            return true;
+                        }
+                    }
+
+                    throw new NotSupportedException();
+                }
+                catch (Exception ex)
+                {
+                    throw new GenerationFailedException($"Unable to determine if {new HandleTypeHandleInfo(typeDefinitionHandle).ToTypeSyntax(this.errorMessageTypeSettings)} is a managed type.", ex);
+                }
+            }
+        }
+
+        [Obsolete]
+        private bool IsManagedType(TypeSyntax? typeSyntax) => typeSyntax is object && this.typesByName.TryGetValue(typeSyntax.ToString(), out TypeDefinitionHandle tdh) && this.IsManagedType(tdh);
 
         private UnmanagedType? GetUnmanagedType(BlobHandle blobHandle)
         {
